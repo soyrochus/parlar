@@ -38,7 +38,7 @@ Usage
 - Run from the project root with `uv`:
   - `uv run ./parlar.py`
 - Controls:
-  - `q` then Enter: quit
+  - Press `q` to quit (no Enter needed)
   - Speak to talk; if the model is speaking, speaking louder than the threshold will cancel it (barge‑in).
 
 Examples

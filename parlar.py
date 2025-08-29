@@ -69,6 +69,8 @@ async def main():
         "response_active": False,          # True between first delta and audio.done/text.done
         "last_cancel_ts": 0.0,             # ms epoch
         "cancel_guard_until": 0.0,         # ms epoch to drop stale deltas
+        "response_inflight": False,        # True after create() until done/canceled
+        "last_assistant_item_id": None,    # track for truncate()
     }
 
     # ---- UI ----
@@ -106,37 +108,89 @@ async def main():
 
     # ---- Realtime + audio plumbing ----
     async with client.beta.realtime.connect(model="gpt-realtime") as conn:
+        # Event loop reference (used by background key thread)
+        loop = asyncio.get_running_loop()
         await conn.session.update(session={
             "modalities": ["audio", "text"],
             "voice": VOICE,
             "instructions": "You are a concise, helpful assistant.",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
+            # Enable user input transcripts:
+            "input_audio_transcription": { "model": "whisper-1" },
+            # Keep VAD but avoid auto-creating responses; we create manually:
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
                 "silence_duration_ms": 150,   # tighter endpointing
-                "prefix_padding_ms": 100
+                "prefix_padding_ms": 100,
+                "create_response": False
             },
         })
 
         mic_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=96)
         audio_out_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
 
-        # stdin reader thread → async queue (so 'q' always works)
+        # Single-key reader → async queue (press 'q' to quit, no Enter)
         key_q: asyncio.Queue[str] = asyncio.Queue()
+        _orig_termios = None
+        _stdin_fd = None
 
-        def stdin_thread():
-            while True:
-                line = sys.stdin.readline()
-                if not line:
-                    continue
-                try:
-                    asyncio.run_coroutine_threadsafe(key_q.put(line), asyncio.get_event_loop())
-                except RuntimeError:
-                    break  # loop closed
+        if os.name == "nt":
+            def key_thread():
+                import msvcrt
+                while True:
+                    if stop.is_set():
+                        break
+                    if msvcrt.kbhit():
+                        try:
+                            ch = msvcrt.getwch()
+                        except Exception:
+                            ch = None
+                        if ch and ch.lower() == 'q':
+                            try:
+                                asyncio.run_coroutine_threadsafe(key_q.put('q'), loop)
+                            except Exception:
+                                pass
+                            break
+                    time.sleep(0.03)
 
-        threading.Thread(target=stdin_thread, daemon=True).start()
+            threading.Thread(target=key_thread, daemon=True).start()
+        else:
+            # POSIX: put stdin into cbreak and poll for single chars
+            try:
+                import termios, tty, select
+                _stdin_fd = sys.stdin.fileno()
+                _orig_termios = termios.tcgetattr(_stdin_fd)
+                tty.setcbreak(_stdin_fd)
+            except Exception:
+                _orig_termios = None
+                _stdin_fd = None
+
+            def key_thread():
+                if _stdin_fd is None:
+                    return
+                import select, os as _os
+                while True:
+                    if stop.is_set():
+                        break
+                    try:
+                        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    except Exception:
+                        r = []
+                    if r:
+                        try:
+                            ch = _os.read(_stdin_fd, 1)
+                        except Exception:
+                            ch = b""
+                        if ch and chr(ch[0]).lower() == 'q':
+                            try:
+                                asyncio.run_coroutine_threadsafe(key_q.put('q'), loop)
+                            except Exception:
+                                pass
+                            break
+
+            threading.Thread(target=key_thread, daemon=True).start()
 
         def on_mic(indata, frames, time_info, status):
             if status:
@@ -161,14 +215,26 @@ async def main():
                         if now_ms - state["last_cancel_ts"] >= CANCEL_COOLDOWN_MS:
                             try:
                                 await conn.response.cancel()
+                                # Truncate unplayed assistant audio on server to keep context aligned
+                                try:
+                                    last_id = state.get("last_assistant_item_id")
+                                    if last_id:
+                                        await conn.conversation.item.truncate(
+                                            item_id=last_id,
+                                            content_index=0,
+                                            audio_end_ms=0
+                                        )
+                                except Exception:
+                                    pass
                                 # Start a short suppression window for late deltas
                                 state["cancel_guard_until"] = now_ms + SUPPRESS_AFTER_CANCEL_MS
                                 print("\n[barge-in] canceled assistant.", flush=True)
-                            except Exception as e:
+                            except Exception:
                                 # benign if no active response
                                 pass
                             state["last_cancel_ts"] = now_ms
                             state["response_active"] = False
+                            state["response_inflight"] = False
                             # Flush any already-queued audio
                             try:
                                 while not audio_out_q.empty():
@@ -199,9 +265,33 @@ async def main():
                 et = getattr(event, "type", None)
                 now_ms = time.time() * 1000.0
 
-                if et in ("input_audio_buffer.speech_stopped", "input_audio_buffer.committed"):
-                    # Don’t block the pump
-                    asyncio.create_task(conn.response.create())
+                if et == "session.created":
+                    # nothing to do; included for completeness
+                    pass
+
+                elif et == "input_audio_buffer.committed":
+                    # Create exactly once per committed user turn
+                    if not state.get("response_inflight", False):
+                        state["response_inflight"] = True
+                        asyncio.create_task(conn.response.create())
+
+                # Track assistant items for later truncate()
+                elif et == "response.output_item.added":
+                    try:
+                        item = getattr(event, "item", None)
+                        if item is not None:
+                            state["last_assistant_item_id"] = getattr(item, "id", None) or state["last_assistant_item_id"]
+                    except Exception:
+                        pass
+
+                elif et == "conversation.item.created":
+                    try:
+                        item = getattr(event, "item", None)
+                        # For assistant messages created during response
+                        if item and getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant":
+                            state["last_assistant_item_id"] = getattr(item, "id", None)
+                    except Exception:
+                        pass
 
                 elif et == "response.audio.delta":
                     # Drop stale deltas for a short window after cancel
@@ -223,6 +313,7 @@ async def main():
 
                 elif et == "response.audio.done":
                     state["response_active"] = False
+                    state["response_inflight"] = False
 
                 elif et == "response.text.delta":
                     if now_ms < state["cancel_guard_until"]:
@@ -233,6 +324,12 @@ async def main():
 
                 elif et == "response.text.done":
                     print()
+                    # text-only sessions: clear inflight as a safeguard
+                    state["response_inflight"] = False
+
+                elif et == "response.done":
+                    state["response_active"] = False
+                    state["response_inflight"] = False
 
                 elif et == "conversation.item.input_audio_transcription.completed":
                     tr = getattr(event, "transcript", "") or ""
@@ -264,7 +361,6 @@ async def main():
                     break
 
         # Ctrl+C → stop
-        loop = asyncio.get_running_loop()
         try:
             loop.add_signal_handler(signal.SIGINT, stop.set)
         except NotImplementedError:
@@ -283,6 +379,14 @@ async def main():
             t.cancel()
         # Quietly drain
         await asyncio.sleep(0.05)
+
+        # Restore terminal settings if we changed them (POSIX)
+        if _orig_termios is not None and _stdin_fd is not None and os.name != "nt":
+            try:
+                import termios
+                termios.tcsetattr(_stdin_fd, termios.TCSADRAIN, _orig_termios)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_AI_KEY")
