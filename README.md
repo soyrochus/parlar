@@ -10,9 +10,10 @@ Features
 - Simple setup via `uv` and `.env`
 
 Requirements
-- Python `>=3.13`
 - macOS, Linux, or Windows with working audio input/output
 - An OpenAI API key with Realtime access (`OPENAI_API_KEY`)
+- Python `>=3.13` (for the Python app)
+- Rust toolchain (`cargo`) if using the Rust app
 
 Install (via uv)
 1) Install `uv` (if you don’t have it):
@@ -60,30 +61,60 @@ Notes
 - The app looks for `OPENAI_API_KEY` (or `OPENAI_AI_KEY`) and will exit with an error if not found.
 - The Realtime session is configured for audio + text modalities and PCM16 audio at 24 kHz.
 
+Rust App
+--------
+
+The Rust CLI in `src/main.rs` implements the same realtime flow with adaptive turn‑taking and robust, interruptible TTS.
+
+Build & Run
+- Build: `cargo build`
+- Run: `cargo run -release` (loads `.env` automatically)
+
+Controls
+- `I`: Interrupt the assistant mid‑reply (cancel + truncate)
+- `Q`: Quit
+
+Environment Options (Rust)
+- `OPENAI_API_KEY`: API key (required)
+- `REALTIME_MODEL`: Realtime model id (default `gpt-realtime`)
+- `REALTIME_VOICE`: TTS voice id (default `alloy`)
+- `SR`: Sample rate Hz (default `24000`)
+- `CHUNK_MS`: Mic chunk size ms (default `20`)
+- `HALF_DUPLEX`: Suppress mic while assistant speaks (default `true`)
+- `BAR_GE_THRESH`: Energy threshold for barge‑in, 0–1 (default `0.20`)
+- `CANCEL_COOLDOWN_MS`: Minimum ms between cancels (default `400`)
+- `SUPPRESS_AFTER_CANCEL_MS`: Drop late deltas window ms (default `800`)
+- `TURN_SIL_MS`: Server VAD silence ms before commit (default `350`)
+- `TURN_VAD_THRESH`: Server VAD energy threshold (default `0.55`)
+- `RESP_DELAY_SHORT_MS`: Extra delay after clear sentence end (default `200`)
+- `RESP_DELAY_LONG_MS`: Extra delay after ambiguous end (default `700`)
+
+Behavior Highlights (Rust)
+- Continuous streaming mic input with incremental transcription.
+- Adaptive turn‑taking: responds only after end‑of‑turn commit plus short, context‑aware delay.
+- Interruptible speech: energy‑based and keyword‑based (e.g., “stop”, “hey”, “wait”).
+- Noise‑robust: requires sustained onset for barge‑in, cooldowns/suppression avoid false triggers.
+
+Rust Audio Notes
+- Uses `cpal` for cross‑platform audio I/O and `crossterm` for non‑blocking keys.
+- On Linux, ensure ALSA is available; on some systems you may need: `sudo apt-get install -y libasound2 libasound2-dev`.
+
 Project Layout
-- `parlar.py`: main script with realtime client, audio I/O, barge‑in, and UI
-- `pyproject.toml`: project metadata and dependencies
+- `parlar.py`: main Python realtime client, audio I/O, barge‑in, and UI
+- `src/main.rs`: Rust realtime client (audio I/O, adaptive turn‑taking, barge‑in)
+- `Cargo.toml`: Rust crate manifest
+- `pyproject.toml`: Python project metadata and dependencies
 - `uv.lock`: pinned dependency versions for reproducible installs
 
-License
-MIT License
+## Contributing
 
-Copyright (c) 2025 Iwan van der Kleijn
+Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the “Software”), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Please make sure to update tests as appropriate.
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+## License and Copyright
+
+MIT License. See [LICENSE](LICENSE.txt) for details.
+
+Copyright © 2025 Iwan van der Kleijn

@@ -1,0 +1,20 @@
+[package]
+name = "parlar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.30", features = ["full"] }
+# Enable TLS for wss://
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+tungstenite = "0.20"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cpal = "0.14"
+crossbeam-channel = "0.5"
+crossterm = "0.27"
+base64 = "0.21"
+anyhow = "1.0"
+dotenvy = "0.15"
+http = "0.2"
