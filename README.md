@@ -95,6 +95,11 @@ Behavior Highlights (Rust)
 - Interruptible speech: energy‑based and keyword‑based (e.g., “stop”, “hey”, “wait”).
 - Noise‑robust: requires sustained onset for barge‑in, cooldowns/suppression avoid false triggers.
 
+Troubleshooting Barge‑in (Rust)
+- If speaking doesn’t interrupt: lower `BAR_GE_THRESH` (e.g., `0.12`) or disable half‑duplex by setting `HALF_DUPLEX=false` to allow full‑duplex mic while the assistant speaks.
+- In half‑duplex, the app now “leaks” only clearly loud onsets to the server so keyword‑based interrupts (“stop”, “wait”, “hey”) still work. If your mic is quiet, reduce `BAR_GE_THRESH`.
+- Ensure input gain is reasonable and that your default input/output devices are correct.
+
 Rust Audio Notes
 - Uses `cpal` for cross‑platform audio I/O and `crossterm` for non‑blocking keys.
 - On Linux, ensure ALSA is available; on some systems you may need: `sudo apt-get install -y libasound2 libasound2-dev`.

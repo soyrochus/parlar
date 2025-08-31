@@ -34,32 +34,24 @@ use tungstenite::Message;
 
 #[derive(Default)]
 struct State {
-    // meters + counters (cosmetic)
+    // lightweight meters
     mic_level: f32,
     spk_level: f32,
     mic_bytes: usize,
     spk_bytes: usize,
 
-    // last lines for display
+    // latest utterances
     last_user: String,
     last_assistant: String,
 
     // response lifecycle
-    response_active: bool,    // between first delta and audio/text done
-    response_inflight: bool,  // after response.create() until done/cancel
+    response_active: bool,
+    response_inflight: bool,
     last_assistant_item_id: Option<String>,
 
-    // cancel throttle and late-delta guard
+    // interruption + transcript
     last_cancel_at: Option<Instant>,
-    cancel_guard_until: Option<Instant>,
-
-    // pending response scheduler generation counter
-    gen_counter: u64,
-
-    // incremental transcription
     last_user_partial: String,
-    // to throttle keyword-based cancel
-    last_keyword_cancel_at: Option<Instant>,
 }
 
 fn chunk_peak_level_i16(samples: &[i16]) -> f32 {
@@ -90,23 +82,10 @@ async fn main() -> Result<()> {
     let sr_hz: u32 = env::var("SR").ok().and_then(|v| v.parse().ok()).unwrap_or(24_000);
     let chunk_ms: u32 = env::var("CHUNK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
 
-    let bar_thresh: f32 = env::var("BAR_GE_THRESH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.20);
-    // If true, do not send mic audio while assistant is speaking/outputting
-    let half_duplex: bool = env::var("HALF_DUPLEX")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
-        .unwrap_or(true);
-    let cancel_cooldown_ms: u64 = env::var("CANCEL_COOLDOWN_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(400);
-    let suppress_after_cancel_ms: u64 = env::var("SUPPRESS_AFTER_CANCEL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(800);
+    // While assistant speaks, gate mic by onset to reduce echo-triggered interrupts
+    let onset_peak: f32 = env::var("INT_ONSET_PEAK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.22);
+    let onset_min_chunks: usize = env::var("INT_ONSET_MIN_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let cancel_cooldown_ms: u64 = env::var("CANCEL_COOLDOWN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
 
     // Server VAD tuning: make the system more patient by default
     let vad_silence_ms: u64 = env::var("TURN_SIL_MS")
@@ -407,16 +386,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Thread: mic → input_audio_buffer.append (+ local barge-in)
+    // Thread: mic → input_audio_buffer.append (simple onset gate while speaking)
     let out_tx_audio = out_tx.clone();
     let state_for_mic = state.clone();
-    let spk_buf_for_mic = spk_buf.clone();
-    let half_duplex_flag = half_duplex;
-    let chunk_ms_local = chunk_ms as usize;
     std::thread::spawn(move || {
         let mut loud_consecutive: usize = 0;
         while let Ok(bytes) = mic_rx.recv() {
-            // Local barge-in (peak threshold) when assistant is speaking
+            // compute peak of this chunk
             let peak = {
                 let samples = unsafe {
                     std::slice::from_raw_parts(bytes.as_ptr() as *const i16, bytes.len() / 2)
@@ -424,98 +400,28 @@ async fn main() -> Result<()> {
                 chunk_peak_level_i16(samples)
             };
 
-            let mut cancel_now = false;
-            {
-                let mut st = state_for_mic.lock().unwrap();
-                // Update loudness streak
-                if peak >= bar_thresh { loud_consecutive += 1; } else { loud_consecutive = 0; }
-
-                // Determine required consecutive chunks to count as intentional speech onset
-                let need_chunks = ((150usize + (chunk_ms_local / 2)) / chunk_ms_local).max(2);
-
-                // In full-duplex: allow barge-in with minimal latency, but still require short streak
-                if !half_duplex_flag && st.response_active && loud_consecutive >= need_chunks {
-                    let now = Instant::now();
-                    let ok_by_cooldown = st
-                        .last_cancel_at
-                        .map(|t| now.duration_since(t) >= Duration::from_millis(cancel_cooldown_ms))
-                        .unwrap_or(true);
-                    if ok_by_cooldown {
-                        st.last_cancel_at = Some(now);
-                        st.cancel_guard_until =
-                            Some(now + Duration::from_millis(suppress_after_cancel_ms));
-                        st.response_active = false;
-                        st.response_inflight = false;
-                        cancel_now = true;
-                        // bump generation to invalidate any pending response scheduling
-                        st.gen_counter = st.gen_counter.wrapping_add(1);
-                    }
-                }
-
-                // In half-duplex: we typically suppress mic during assistant speech,
-                // but still support interruption when a confident onset is detected.
-                if half_duplex_flag && (st.response_active || st.response_inflight)
-                    && loud_consecutive >= need_chunks + 1
-                {
-                    let now = Instant::now();
-                    let ok_by_cooldown = st
-                        .last_cancel_at
-                        .map(|t| now.duration_since(t) >= Duration::from_millis(cancel_cooldown_ms))
-                        .unwrap_or(true);
-                    if ok_by_cooldown {
-                        st.last_cancel_at = Some(now);
-                        st.cancel_guard_until =
-                            Some(now + Duration::from_millis(suppress_after_cancel_ms));
-                        st.response_active = false;
-                        st.response_inflight = false;
-                        cancel_now = true;
-                        st.gen_counter = st.gen_counter.wrapping_add(1);
-                    }
-                }
+            // update mic meter
+            if let Ok(mut st) = state_for_mic.lock() {
+                st.mic_level = peak;
+                st.mic_bytes += bytes.len();
             }
 
-            if cancel_now {
-                // Server-side cancel + truncate; also flush local speaker buffer
-                let _ = out_tx_audio.send(Message::Text(
-                    json!({"type": "response.cancel"}).to_string(),
-                ));
-                if let Some(item_id) = state_for_mic.lock().unwrap().last_assistant_item_id.clone()
-                {
-                    let _ = out_tx_audio.send(Message::Text(
-                        json!({
-                            "type": "conversation.item.truncate",
-                            "item_id": item_id,
-                            "content_index": 0,
-                            "audio_end_ms": 0
-                        })
-                        .to_string(),
-                    ));
-                }
-                if let Ok(mut q) = spk_buf_for_mic.lock() {
-                    q.clear();
-                }
-                eprintln!("\n[barge-in] canceled assistant.");
+            // Only gate while the assistant is speaking to avoid echo false-positives
+            let speaking = state_for_mic
+                .lock()
+                .map(|s| s.response_active || s.response_inflight)
+                .unwrap_or(false);
+            if speaking {
+                if peak >= onset_peak { loud_consecutive += 1; } else { loud_consecutive = 0; }
+                if loud_consecutive < onset_min_chunks { continue; }
+            } else {
+                loud_consecutive = 0;
             }
 
-            // In half-duplex, suppress mic while assistant is active/playing
-            if half_duplex_flag {
-                let speaking = {
-                    let st = state_for_mic.lock().unwrap();
-                    st.response_active || st.response_inflight
-                };
-                let has_spk = spk_buf_for_mic.lock().map(|q| !q.is_empty()).unwrap_or(false);
-                if speaking || has_spk {
-                    // Skip forwarding this chunk to avoid echo-triggered interruptions
-                    continue;
-                }
-            }
-
-            // Send mic chunk
+            // forward mic chunk
             let b64 = base64::encode(&bytes);
             let ev = json!({"type": "input_audio_buffer.append", "audio": b64});
-            if out_tx_audio.send(Message::Text(ev.to_string())).is_err() {
-                break;
-            }
+            if out_tx_audio.send(Message::Text(ev.to_string())).is_err() { break; }
         }
     });
 
@@ -586,16 +492,6 @@ async fn main() -> Result<()> {
         };
         let et = evt["type"].as_str().unwrap_or("");
 
-        // Late-delta suppression window after cancel
-        let drop_deltas = {
-            let st = state_for_rx.lock().unwrap();
-            if let Some(deadline) = st.cancel_guard_until {
-                Instant::now() < deadline
-            } else {
-                false
-            }
-        };
-
         match et {
             "session.created" => { /* no-op */ }
             "error" => {
@@ -613,33 +509,18 @@ async fn main() -> Result<()> {
                 let delay_ms = {
                     let st = st_arc.lock().unwrap();
                     let u = st.last_user.clone();
-                    // Heuristic: sentence-ending punctuation => short delay; otherwise longer
                     if u.ends_with('.') || u.ends_with('!') || u.ends_with('?') {
                         resp_delay_short_ms
                     } else {
                         resp_delay_long_ms
                     }
                 };
-                // bump generation and capture it
-                let my_gen = {
-                    let mut st = state_for_rx.lock().unwrap();
-                    st.gen_counter = st.gen_counter.wrapping_add(1);
-                    st.gen_counter
-                };
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    let should_send = {
-                        let st = st_arc.lock().unwrap();
-                        st.gen_counter == my_gen && !st.response_inflight && !st.response_active
-                    };
-                    if should_send {
-                        {
-                            let mut st = st_arc.lock().unwrap();
-                            st.response_inflight = true;
-                        }
-                        let _ = out.send(Message::Text(
-                            json!({"type":"response.create"}).to_string(),
-                        ));
+                    let mut st = st_arc.lock().unwrap();
+                    if !st.response_inflight && !st.response_active {
+                        st.response_inflight = true;
+                        let _ = out.send(Message::Text(json!({"type":"response.create"}).to_string()));
                     }
                 });
             }
@@ -673,9 +554,6 @@ async fn main() -> Result<()> {
 
             // Assistant audio streaming
             "response.audio.delta" => {
-                if drop_deltas {
-                    continue;
-                }
                 if let Some(b64) = evt["delta"].as_str() {
                     if let Ok(bytes) = base64::decode(b64) {
                         let samples = unsafe {
@@ -702,9 +580,6 @@ async fn main() -> Result<()> {
 
             // Assistant text streaming
             "response.text.delta" => {
-                if drop_deltas {
-                    continue;
-                }
                 if let Some(delta) = evt["delta"].as_str() {
                     print!("{}", delta);
                     use std::io::Write;
@@ -722,15 +597,26 @@ async fn main() -> Result<()> {
                 st.response_inflight = false;
             }
 
-            // Optional: server indicates start of user speech — drop queued TTS immediately
+            // Server indicates start of user speech — cancel and flush audio
             "input_audio_buffer.speech_started" => {
-                // Cancel any pending response scheduling and drop queued TTS immediately
-                {
-                    let mut st = state_for_rx.lock().unwrap();
-                    st.gen_counter = st.gen_counter.wrapping_add(1);
+                let mut st = state_for_rx.lock().unwrap();
+                if st.response_active || st.response_inflight {
+                    st.response_active = false;
+                    st.response_inflight = false;
+                    st.last_cancel_at = Some(Instant::now());
+                    drop(st);
+                    let _ = out_tx.send(Message::Text(json!({"type":"response.cancel"}).to_string()));
+                    if let Some(item_id) = state_for_rx.lock().unwrap().last_assistant_item_id.clone() {
+                        let _ = out_tx.send(Message::Text(json!({
+                            "type":"conversation.item.truncate",
+                            "item_id": item_id,
+                            "content_index": 0,
+                            "audio_end_ms": 0
+                        }).to_string()));
+                    }
+                    let mut q = spk_buf_for_rx.lock().unwrap();
+                    q.clear();
                 }
-                let mut q = spk_buf_for_rx.lock().unwrap();
-                q.clear();
             }
 
             // When enabled in session: finalized input transcript event
@@ -746,14 +632,12 @@ async fn main() -> Result<()> {
             // Incremental transcription deltas (for continuous recognition + barge-in keywords)
             "conversation.item.input_audio_transcription.delta" => {
                 if let Some(delta) = evt["delta"].as_str() {
-                    // append to partial transcript buffer
                     let mut st = state_for_rx.lock().unwrap();
                     st.last_user_partial.push_str(delta);
-                    // Check for interruption keywords when assistant is speaking
                     let speaking = st.response_active || st.response_inflight;
                     let now = Instant::now();
-                    let keyword_cooldown_ok = st
-                        .last_keyword_cancel_at
+                    let cooldown_ok = st
+                        .last_cancel_at
                         .map(|t| now.duration_since(t) >= Duration::from_millis(cancel_cooldown_ms))
                         .unwrap_or(true);
                     let text_lc = st.last_user_partial.to_lowercase();
@@ -762,37 +646,21 @@ async fn main() -> Result<()> {
                         || text_lc.contains(" wait")
                         || text_lc.contains(" hold on")
                         || text_lc.contains(" hey");
-                    if speaking && keyword_cooldown_ok && contains_hot {
-                        // mark cooldown to avoid repeated cancels
-                        st.last_keyword_cancel_at = Some(now);
+                    if speaking && cooldown_ok && contains_hot {
+                        st.last_cancel_at = Some(now);
                         drop(st);
-                        // Send cancel + truncate and clear speaker buffer
-                        let _ = out_tx.send(Message::Text(
-                            json!({"type": "response.cancel"}).to_string(),
-                        ));
-                        if let Some(item_id) = state_for_rx
-                            .lock()
-                            .unwrap()
-                            .last_assistant_item_id
-                            .clone()
-                        {
+                        let _ = out_tx
+                            .send(Message::Text(json!({"type":"response.cancel"}).to_string()));
+                        if let Some(item_id) = state_for_rx.lock().unwrap().last_assistant_item_id.clone() {
                             let _ = out_tx.send(Message::Text(
-                                json!({
-                                    "type": "conversation.item.truncate",
-                                    "item_id": item_id,
-                                    "content_index": 0,
-                                    "audio_end_ms": 0
-                                })
-                                .to_string(),
+                                json!({"type":"conversation.item.truncate","item_id":item_id,"content_index":0,"audio_end_ms":0}).to_string()
                             ));
                         }
                         if let Ok(mut q) = spk_buf_for_rx.lock() { q.clear(); }
-                        // also suppress incoming deltas briefly
                         let mut st2 = state_for_rx.lock().unwrap();
-                        st2.cancel_guard_until = Some(Instant::now() + Duration::from_millis(suppress_after_cancel_ms));
+                        st2.last_user_partial.clear();
                         st2.response_active = false;
                         st2.response_inflight = false;
-                        st2.gen_counter = st2.gen_counter.wrapping_add(1);
                         eprintln!("\n[interrupt:keyword] assistant canceled.");
                     }
                 }
